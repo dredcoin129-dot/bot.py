@@ -1,6 +1,0 @@
-{
-  "$schema": "https://schema.railpack.com",
-  "deploy": {
-    "startCommand": "python memecoin_alert_bot.py"
-  }
-}
