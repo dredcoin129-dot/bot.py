@@ -1,61 +1,216 @@
-"""
-DexScreener new-memecoin alert bot
-===================================
-
-Scans for very-new tokens on a given chain and pushes the Telegram
-invite link for any that pass your filters:
-  - market cap between MIN_MC and MAX_MC
-  - has both a Telegram group and a Twitter/X account
-  - has NO website
-  - pair created within AGE_HOURS
-
-READ THIS FIRST -- one gap you'll need to fill in:
-DexScreener's public API (api.dexscreener.com, free, no key needed) is
-built for looking up pairs/tokens you already have an address for --
-search, or by address. There is no documented endpoint that streams
-"every new pair created on chain X." So `discover_candidate_addresses()`
-below is a stub: wire in your existing scraper's output, an Apify
-DexScreener actor, or an on-chain "pool created" listener. Everything
-downstream of that (enrichment, filtering, chain switching, dedup,
-scheduling, commands, link-only output) is fully implemented against
-the real DexScreener response schema.
-
-Setup:
-    pip install -r requirements.txt
-    export TELEGRAM_TOKEN="123456:your-botfather-token"
-    python bot.py
-"""
-
-from __future__ import annotations
-
-import logging
 import os
-import time
-from dataclasses import dataclass, field
-from typing import Optional
-
-import httpx
+import asyncio
+import logging
+import requests
+from datetime import datetime, timezone
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("memecoin-bot")
+# ---------- CONFIG (from env or defaults) ----------
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+if not TELEGRAM_TOKEN:
+    raise ValueError("Set TELEGRAM_TOKEN environment variable!")
 
-DEXSCREENER_TOKENS_URL = "https://api.dexscreener.com/tokens/v1/{chain}/{address}"
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", 300))
+CHAINS = os.environ.get("CHAINS", "solana,robinhood,arc").split(",")
 
-DEFAULT_CHAIN = os.environ.get("DEFAULT_CHAIN", "solana")
-DEFAULT_MIN_MC = float(os.environ.get("MIN_MC", 5_000))
-DEFAULT_MAX_MC = float(os.environ.get("MAX_MC", 500_000))
-DEFAULT_AGE_HOURS = float(os.environ.get("AGE_HOURS", 24))
-DEFAULT_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL", 300))
+# Filter thresholds
+MIN_LIQ = 1000
+MAX_LIQ = 3000
+MAX_MC = 10000
+MAX_FDV = 10000
+MAX_AGE_HOURS = 336
+MAX_VOL_H24 = 1000
+MAX_BUYS_H24 = 300
+MAX_SELLS_H24 = 500
 
+API_BASE = "https://api.dexscreener.com"
+HEADERS = {"User-Agent": "MemeHunterBot/1.0"}
 
-@dataclass
-class ChatState:
-    """Per-chat settings and in-memory 'already sent' tracking.
-    Resets on restart -- that's an accepted tradeoff, not a bug."""
-    chain: str = DEFAULT_CHAIN
-    min_mc: float = DEFAULT_MIN_MC
-    max_mc: float = DEFAULT_MAX_MC
-    age_hours: float = DEFAULT_AGE_HOURS
-    interval_seconds: int = DEFAULT_INTERVAL_SECONDS
+logging.basicConfig(level=logging.INFO)
+
+# ---------- API FETCH ----------
+def fetch_new_pairs(chain: str):
+    """Fetch latest pairs for a chain using the public API."""
+    # The /latest/dex/search endpoint can be used to discover pairs.
+    # For a "new pairs" feed, we poll token profiles and then fetch pairs.
+    try:
+        resp = requests.get(
+            f"{API_BASE}/token-profiles/latest/v1",
+            headers=HEADERS,
+            timeout=15
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        logging.error(f"Profile fetch failed: {e}")
+        return []
+
+    profiles = resp.json()
+    found = []
+
+    for profile in profiles:
+        if profile.get("chainId") != chain:
+            continue
+
+        token_address = profile.get("tokenAddress")
+        if not token_address:
+            continue
+
+        # Fetch all pairs for this token
+        try:
+            pair_resp = requests.get(
+                f"{API_BASE}/token-pairs/v1/{chain}/{token_address}",
+                headers=HEADERS,
+                timeout=15
+            )
+            pair_resp.raise_for_status()
+        except Exception:
+            continue
+
+        pairs = pair_resp.json()
+        if not pairs:
+            continue
+
+        for pair in pairs:
+            result = evaluate_pair(pair)
+            if result:
+                found.append(result)
+
+    return found
+
+# ---------- FILTER ENGINE ----------
+def evaluate_pair(pair: dict):
+    """Apply all filters to a single pair. Returns dict if it passes."""
+    liq = pair.get("liquidity", {}).get("usd")
+    if liq is None or not (MIN_LIQ <= liq <= MAX_LIQ):
+        return None
+
+    mc = pair.get("marketCap")
+    if mc is None or mc > MAX_MC:
+        return None
+
+    fdv = pair.get("fdv")
+    if fdv is None or fdv > MAX_FDV:
+        return None
+
+    # Pair age
+    created_ms = pair.get("pairCreatedAt")
+    if not created_ms:
+        return None
+    age_hours = (datetime.now(timezone.utc).timestamp() * 1000 - created_ms) / (1000 * 3600)
+    if age_hours > MAX_AGE_HOURS:
+        return None
+
+    # 24h volume
+    vol_h24 = pair.get("volume", {}).get("h24")
+    if vol_h24 is None or vol_h24 > MAX_VOL_H24:
+        return None
+
+    # 24h txns
+    txns = pair.get("txns", {}).get("h24", {})
+    buys = txns.get("buys")
+    sells = txns.get("sells")
+    if buys is None or buys > MAX_BUYS_H24:
+        return None
+    if sells is None or sells > MAX_SELLS_H24:
+        return None
+
+    # Socials: must have Telegram, no website
+    info = pair.get("info", {})
+    socials = info.get("socials", [])
+    websites = info.get("websites", [])
+
+    if websites:
+        return None  # must NOT have a website
+
+    tg_link = None
+    for s in socials:
+        if s.get("platform", "").lower() == "telegram":
+            tg_link = s.get("url") or s.get("handle")
+            break
+
+    if not tg_link:
+        return None
+
+    return {
+        "tg": tg_link,
+        "name": pair.get("baseToken", {}).get("symbol", "UNKNOWN"),
+        "mc": mc,
+        "liq": liq,
+        "age_h": round(age_hours, 1),
+    }
+
+# ---------- BOT COMMANDS ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if "seen" not in context.bot_data:
+        context.bot_data["seen"] = set()
+    if "chat_id" not in context.bot_data:
+        context.bot_data["chat_id"] = update.effective_chat.id
+
+    await update.message.reply_text(
+        "🤖 Meme Hunter active!\n\n"
+        f"Chains: {', '.join(CHAINS)}\n"
+        f"Liquidity: ${MIN_LIQ}–${MAX_LIQ}\n"
+        f"MC max: ${MAX_MC}\n"
+        f"FDV max: ${MAX_FDV}\n"
+        f"Age max: {MAX_AGE_HOURS}h\n"
+        f"24h Vol max: ${MAX_VOL_H24}\n"
+        f"24h Buys max: ${MAX_BUYS_H24}\n"
+        f"24h Sells max: ${MAX_SELLS_H24}\n\n"
+        "Commands:\n"
+        "/scannow – trigger a manual scan\n"
+        "/status – show filters\n"
+    )
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"📊 **Filters**\n"
+        f"Chains: {', '.join(CHAINS)}\n"
+        f"Liquidity: ${MIN_LIQ}–${MAX_LIQ}\n"
+        f"Market Cap max: ${MAX_MC}\n"
+        f"FDV max: ${MAX_FDV}\n"
+        f"Pair Age max: {MAX_AGE_HOURS}h\n"
+        f"24h Volume max: ${MAX_VOL_H24}\n"
+        f"24h Buys max: ${MAX_BUYS_H24}\n"
+        f"24h Sells max: ${MAX_SELLS_H24}"
+    )
+
+async def scan_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ Scanning now...")
+    await scan_and_send(context)
+
+# ---------- CORE SCAN JOB ----------
+async def scan_and_send(context: ContextTypes.DEFAULT_TYPE):
+    seen = context.bot_data.get("seen", set())
+    chat_id = context.bot_data.get("chat_id")
+    if not chat_id:
+        return
+
+    for chain in CHAINS:
+        pairs = fetch_new_pairs(chain.strip())
+        for pair in pairs:
+            if pair["tg"] in seen:
+                continue
+
+            # Send ONLY the Telegram link, as requested
+            await context.bot.send_message(chat_id=chat_id, text=pair["tg"])
+            seen.add(pair["tg"])
+            await asyncio.sleep(0.5)
+
+    context.bot_data["seen"] = seen
+
+# ---------- MAIN ----------
+def main():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("scannow", scan_now))
+
+    job_queue = app.job_queue
+    job_queue.run_repeating(scan_and_send, interval=CHECK_INTERVAL, first=10)
+
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
