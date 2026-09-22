@@ -1,8 +1,7 @@
 """
-Meme Hunter Bot — dexscraper edition
--------------------------------------
-Scans DexScreener new/trending pairs across any supported chain using the
-`dexscraper` SDK (with Cloudflare bypass).
+Meme Hunter Bot — Official DexScreener REST API edition
+-------------------------------------------------------
+Uses the public DexScreener API (no Cloudflare bypass needed).
 
 Filters:
 - Liquidity:  $1,000 – $3,000
@@ -23,10 +22,9 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
+import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-
-from dexscraper import DexScraper, ScrapingConfig, Filters, Chain, RankBy, Timeframe
 
 # --------------------------------------------------
 # CONFIG
@@ -36,8 +34,6 @@ if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN environment variable is required!")
 
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", 300))
-DEBUG_MODE = os.environ.get("DEBUG_MODE", "false").lower() == "true"
-
 DEFAULT_CHAINS = os.environ.get(
     "CHAINS",
     "solana,ethereum,bsc,base,arbitrum,polygon,optimism"
@@ -54,6 +50,12 @@ MAX_VOL_H24 = 1_000
 MAX_BUYS_H24 = 300
 MAX_SELLS_H24 = 500
 
+API_BASE = "https://api.dexscreener.com"
+HEADERS = {
+    "User-Agent": "MemeHunterBot/1.0",
+    "Accept": "application/json",
+}
+
 # --------------------------------------------------
 # LOGGING
 # --------------------------------------------------
@@ -63,238 +65,140 @@ logging.basicConfig(
 )
 log = logging.getLogger("MemeHunter")
 
-# --------------------------------------------------
-# CHAIN MAPPING
-# --------------------------------------------------
-CHAIN_MAP = {
-    "solana": Chain.SOLANA,
-    "ethereum": Chain.ETHEREUM,
-    "bsc": Chain.BSC,
-    "base": Chain.BASE,
-    "arbitrum": Chain.ARBITRUM,
-    "polygon": Chain.POLYGON,
-    "optimism": Chain.OPTIMISM,
-}
-
-
-def get_chain_enum(chain_name: str):
-    """Map a string chain name to the dexscraper Chain enum."""
-    return CHAIN_MAP.get(chain_name.lower())
-
 
 # --------------------------------------------------
-# SAFE ATTRIBUTE ACCESS
+# API HELPERS
 # --------------------------------------------------
-def get_attr(obj, *names, default=None):
-    """Return the first attribute found on obj from the given names."""
-    for name in names:
-        if hasattr(obj, name):
-            val = getattr(obj, name)
-            if val is not None:
-                return val
-    return default
+def fetch_latest_profiles():
+    """Fetch latest token profiles from DexScreener."""
+    try:
+        r = requests.get(f"{API_BASE}/token-profiles/latest/v1", headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        log.error(f"fetch_latest_profiles error: {e}")
+        return []
 
 
-def get_nested_attr(obj, path: str, default=None):
-    """Access nested attributes using dot notation."""
-    current = obj
-    for part in path.split("."):
-        if current is None:
-            return default
-        current = getattr(current, part, None)
-    return current if current is not None else default
-
-
-# --------------------------------------------------
-# TOKEN EXTRACTION
-# --------------------------------------------------
-def extract_token_data(token) -> dict:
-    """Extract the fields we need from a dexscraper token object."""
-
-    # Symbol / name
-    symbol = get_attr(token, "symbol", "base_token_symbol", "baseTokenSymbol", default="?")
-
-    # Market cap
-    mc = get_attr(token, "market_cap", "marketCap", "mc", default=None)
-    if mc is None:
-        mc = get_nested_attr(token, "profile.market_cap")
-
-    # FDV
-    fdv = get_attr(token, "fdv", "fully_diluted_valuation", default=None)
-
-    # Liquidity
-    liq = get_attr(token, "liquidity", "liquidity_usd", default=None)
-    if isinstance(liq, dict):
-        liq = liq.get("usd")
-    if liq is None:
-        liq = get_nested_attr(token, "liquidity.usd")
-
-    # Pair creation time
-    created = get_attr(token, "pair_created_at", "pairCreatedAt", "created_at", default=None)
-    if created is None:
-        created = get_nested_attr(token, "profile.pair_created_at")
-
-    # 24h volume
-    vol = get_attr(token, "volume_24h", "volume_h24", default=None)
-    if isinstance(vol, dict):
-        vol = vol.get("h24")
-    if vol is None:
-        vol = get_nested_attr(token, "volume.h24")
-
-    # 24h txns
-    buys = get_attr(token, "buys_24h", "buys_h24", default=None)
-    sells = get_attr(token, "sells_24h", "sells_h24", default=None)
-    if buys is None:
-        buys = get_nested_attr(token, "txns.h24.buys")
-    if sells is None:
-        sells = get_nested_attr(token, "txns.h24.sells")
-
-    # Socials & websites
-    socials = get_attr(token, "socials", default=None)
-    if socials is None:
-        socials = get_nested_attr(token, "profile.socials", default=[])
-
-    websites = get_attr(token, "websites", default=None)
-    if websites is None:
-        websites = get_nested_attr(token, "profile.websites", default=[])
-
-    # Telegram link
-    tg_link = None
-    if socials:
-        for s in socials:
-            platform = (get_attr(s, "platform", "type", default="") or "").lower()
-            if platform == "telegram":
-                tg_link = get_attr(s, "url", "handle", default=None)
-                break
-
-    # Age in hours
-    age_hours = None
-    if created:
-        try:
-            if isinstance(created, (int, float)):
-                created_ms = created if created > 1e12 else created * 1000
-                age_hours = (datetime.now(timezone.utc).timestamp() * 1000 - created_ms) / 3_600_000
-            else:
-                # Assume ISO string
-                dt = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
-                age_hours = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
-        except Exception:
-            age_hours = None
-
-    return {
-        "symbol": symbol,
-        "mc": mc,
-        "fdv": fdv,
-        "liq": liq,
-        "created": created,
-        "age_hours": age_hours,
-        "vol_h24": vol,
-        "buys": buys,
-        "sells": sells,
-        "tg": tg_link,
-        "has_website": bool(websites),
-        "raw": token,
-    }
+def fetch_token_pairs(chain: str, token_address: str):
+    """Fetch all DEX pairs for a token on a given chain."""
+    try:
+        r = requests.get(
+            f"{API_BASE}/token-pairs/v1/{chain}/{token_address}",
+            headers=HEADERS,
+            timeout=20,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        log.error(f"fetch_token_pairs error ({chain}/{token_address}): {e}")
+        return []
 
 
 # --------------------------------------------------
 # FILTER ENGINE
 # --------------------------------------------------
-def passes_filters(data: dict) -> bool:
-    """Return True if the token data passes all filters."""
+def evaluate_pair(pair: dict):
+    """Return a dict if the pair passes all filters, else None."""
 
     # Liquidity
-    liq = data["liq"]
+    liq = (pair.get("liquidity") or {}).get("usd")
     if liq is None or not (MIN_LIQ <= liq <= MAX_LIQ):
-        return False
+        return None
 
-    # Market cap
-    mc = data["mc"]
+    # Market Cap
+    mc = pair.get("marketCap")
     if mc is None or mc > MAX_MC:
-        return False
+        return None
 
     # FDV
-    fdv = data["fdv"]
+    fdv = pair.get("fdv")
     if fdv is None or fdv > MAX_FDV:
-        return False
+        return None
 
     # Age
-    age = data["age_hours"]
-    if age is None or age > MAX_AGE_HOURS:
-        return False
+    created_ms = pair.get("pairCreatedAt")
+    if not created_ms:
+        return None
+    age_hours = (datetime.now(timezone.utc).timestamp() * 1000 - created_ms) / 3_600_000
+    if age_hours > MAX_AGE_HOURS:
+        return None
 
-    # 24h volume
-    vol = data["vol_h24"]
-    if vol is None or vol > MAX_VOL_H24:
-        return False
+    # Volume
+    vol_h24 = (pair.get("volume") or {}).get("h24")
+    if vol_h24 is None or vol_h24 > MAX_VOL_H24:
+        return None
 
-    # 24h buys / sells
-    buys = data["buys"]
-    sells = data["sells"]
+    # Txns
+    txns = (pair.get("txns") or {}).get("h24") or {}
+    buys = txns.get("buys")
+    sells = txns.get("sells")
     if buys is None or buys > MAX_BUYS_H24:
-        return False
+        return None
     if sells is None or sells > MAX_SELLS_H24:
-        return False
+        return None
 
     # No website
-    if data["has_website"]:
-        return False
+    info = pair.get("info") or {}
+    websites = info.get("websites") or []
+    if websites:
+        return None
 
-    # Must have Telegram
-    if not data["tg"]:
-        return False
+    # Telegram
+    socials = info.get("socials") or []
+    tg_link = None
+    for s in socials:
+        platform = (s.get("platform") or "").lower()
+        if platform == "telegram":
+            tg_link = s.get("url") or s.get("handle")
+            break
 
-    return True
+    if not tg_link:
+        return None
+
+    base = pair.get("baseToken") or {}
+    return {
+        "tg": tg_link,
+        "symbol": base.get("symbol", "?"),
+        "chain": pair.get("chainId", "?"),
+        "mc": mc,
+        "liq": liq,
+    }
 
 
 # --------------------------------------------------
 # SCAN LOGIC
 # --------------------------------------------------
-async def scan_chain(chain_name: str, seen: set) -> list:
-    """Scan a single chain and return a list of matching token data dicts."""
-    chain_enum = get_chain_enum(chain_name)
-    if chain_enum is None:
-        log.warning(f"Unknown chain: {chain_name}")
-        return []
-
-    config = ScrapingConfig(
-        timeframe=Timeframe.H24,
-        rank_by=RankBy.VOLUME,
-        filters=Filters(
-            chain_ids=[chain_enum],
-            liquidity_min=MIN_LIQ,
-        ),
-    )
-
+def scan_chain(chain: str, seen: set) -> list:
+    """Scan a single chain using the official API."""
     results = []
-    try:
-        scraper = DexScraper(config=config, use_cloudflare_bypass=True)
-        batch = await scraper.extract_token_data()
-    except Exception as e:
-        log.error(f"dexscraper failed for {chain_name}: {e}")
-        return []
+    profiles = fetch_latest_profiles()
+    if not profiles:
+        log.info(f"{chain}: no profiles returned")
+        return results
 
-    tokens = batch.get_top_tokens(500) if hasattr(batch, "get_top_tokens") else []
-    if not tokens:
-        tokens = getattr(batch, "tokens", []) or []
+    chain_profiles = [p for p in profiles if (p.get("chainId") or "").lower() == chain.lower()]
+    log.info(f"{chain}: {len(chain_profiles)} profiles for this chain")
 
-    log.info(f"{chain_name}: {len(tokens)} tokens fetched from dexscraper")
-
-    for token in tokens:
-        try:
-            data = extract_token_data(token)
-        except Exception as e:
-            log.error(f"extract_token_data error: {e}")
+    for profile in chain_profiles:
+        token_addr = profile.get("tokenAddress")
+        if not token_addr:
             continue
 
-        if not passes_filters(data):
-            continue
-        if data["tg"] in seen:
+        pairs = fetch_token_pairs(chain, token_addr)
+        if not pairs:
             continue
 
-        results.append(data)
-        seen.add(data["tg"])
+        for p in pairs:
+            evaluated = evaluate_pair(p)
+            if not evaluated:
+                continue
+            if evaluated["tg"] in seen:
+                continue
+            results.append(evaluated)
+            seen.add(evaluated["tg"])
 
+    log.info(f"{chain}: {len(results)} tokens passed filters")
     return results
 
 
@@ -325,8 +229,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/chains – list active chains\n"
         "/setchains <c1,c2,...> – replace the chain list\n"
         "/addchain <c> – add one chain\n"
-        "/removechain <c> – remove one chain\n"
-        "/debug – inspect one token's raw attributes",
+        "/removechain <c> – remove one chain",
         parse_mode="Markdown",
     )
 
@@ -401,48 +304,6 @@ async def cmd_scannow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await scan_and_send(context)
 
 
-async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fetch one batch and print the raw attributes of the first token."""
-    await update.message.reply_text("🔍 Fetching one token for inspection...")
-    chain = context.bot_data.get("chains", INITIAL_CHAINS)[0]
-    chain_enum = get_chain_enum(chain)
-    if chain_enum is None:
-        await update.message.reply_text(f"Unknown chain: {chain}")
-        return
-
-    try:
-        config = ScrapingConfig(
-            timeframe=Timeframe.H24,
-            rank_by=RankBy.VOLUME,
-            filters=Filters(chain_ids=[chain_enum], liquidity_min=0),
-        )
-        scraper = DexScraper(config=config, use_cloudflare_bypass=True)
-        batch = await scraper.extract_token_data()
-        tokens = batch.get_top_tokens(1) if hasattr(batch, "get_top_tokens") else []
-        if not tokens:
-            tokens = getattr(batch, "tokens", []) or []
-        if not tokens:
-            await update.message.reply_text("No tokens returned.")
-            return
-
-        token = tokens[0]
-        lines = ["*Token attributes:*"]
-        for attr in dir(token):
-            if attr.startswith("_"):
-                continue
-            try:
-                val = getattr(token, attr)
-            except Exception:
-                continue
-            if callable(val):
-                continue
-            lines.append(f"`{attr}` = `{val}`")
-        text = "\n".join(lines[:60])
-        await update.message.reply_text(text, parse_mode="Markdown")
-    except Exception as e:
-        await update.message.reply_text(f"Debug error: {e}")
-
-
 # --------------------------------------------------
 # CORE SCAN LOOP
 # --------------------------------------------------
@@ -459,7 +320,7 @@ async def scan_and_send(context: ContextTypes.DEFAULT_TYPE):
 
     for chain in chains:
         try:
-            matches = await scan_chain(chain, seen)
+            matches = scan_chain(chain, seen)
         except Exception as e:
             log.error(f"scan_chain({chain}) failed: {e}")
             continue
@@ -467,7 +328,7 @@ async def scan_and_send(context: ContextTypes.DEFAULT_TYPE):
         for m in matches:
             try:
                 await context.bot.send_message(chat_id=chat_id, text=m["tg"])
-                log.info(f"Sent {chain}/{m['symbol']} -> {m['tg']}")
+                log.info(f"Sent {m['chain']}/{m['symbol']} -> {m['tg']}")
             except Exception as e:
                 log.error(f"send_message failed: {e}")
             await asyncio.sleep(0.5)
@@ -486,7 +347,6 @@ def main():
     app.add_handler(CommandHandler("addchain", cmd_addchain))
     app.add_handler(CommandHandler("removechain", cmd_removechain))
     app.add_handler(CommandHandler("scannow", cmd_scannow))
-    app.add_handler(CommandHandler("debug", cmd_debug))
 
     if app.job_queue is not None:
         app.job_queue.run_repeating(scan_and_send, interval=CHECK_INTERVAL, first=10)
