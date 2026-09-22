@@ -1,8 +1,6 @@
 """
 Meme Hunter Bot — Official DexScreener REST API edition
 -------------------------------------------------------
-Uses the public DexScreener API (no Cloudflare bypass needed).
-
 Filters:
 - Liquidity:  $1,000 – $3,000
 - Market Cap: max $10,000
@@ -12,7 +10,6 @@ Filters:
 - 24h Buys:   max $300
 - 24h Sells:  max $500
 - Must have Telegram link
-- Must NOT have a website
 
 Output: only the Telegram invite link.
 """
@@ -70,7 +67,6 @@ log = logging.getLogger("MemeHunter")
 # API HELPERS
 # --------------------------------------------------
 def fetch_latest_profiles():
-    """Fetch latest token profiles from DexScreener."""
     try:
         r = requests.get(f"{API_BASE}/token-profiles/latest/v1", headers=HEADERS, timeout=20)
         r.raise_for_status()
@@ -81,7 +77,6 @@ def fetch_latest_profiles():
 
 
 def fetch_token_pairs(chain: str, token_address: str):
-    """Fetch all DEX pairs for a token on a given chain."""
     try:
         r = requests.get(
             f"{API_BASE}/token-pairs/v1/{chain}/{token_address}",
@@ -138,13 +133,10 @@ def evaluate_pair(pair: dict):
     if sells is None or sells > MAX_SELLS_H24:
         return None
 
-    # No website
-    info = pair.get("info") or {}
-    websites = info.get("websites") or []
-    if websites:
-        return None
+    # NOTE: "no website" filter removed as requested.
 
     # Telegram
+    info = pair.get("info") or {}
     socials = info.get("socials") or []
     tg_link = None
     for s in socials:
@@ -170,11 +162,9 @@ def evaluate_pair(pair: dict):
 # SCAN LOGIC
 # --------------------------------------------------
 def scan_chain(chain: str, seen: set) -> list:
-    """Scan a single chain using the official API."""
     results = []
     profiles = fetch_latest_profiles()
     if not profiles:
-        log.info(f"{chain}: no profiles returned")
         return results
 
     chain_profiles = [p for p in profiles if (p.get("chainId") or "").lower() == chain.lower()]
@@ -222,14 +212,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• 24h Volume: max ${MAX_VOL_H24:,}\n"
         f"• 24h Buys: max {MAX_BUYS_H24}\n"
         f"• 24h Sells: max {MAX_SELLS_H24}\n"
-        "• Must have Telegram, must NOT have website\n\n"
+        "• Must have Telegram\n\n"
         "*Commands:*\n"
         "/status – show current settings\n"
         "/scannow – force a manual scan\n"
         "/chains – list active chains\n"
         "/setchains <c1,c2,...> – replace the chain list\n"
         "/addchain <c> – add one chain\n"
-        "/removechain <c> – remove one chain",
+        "/removechain <c> – remove one chain\n"
+        "/why <chain> – diagnose why tokens fail",
         parse_mode="Markdown",
     )
 
@@ -246,8 +237,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Age max: {MAX_AGE_HOURS}h\n"
         f"Vol max: ${MAX_VOL_H24:,}\n"
         f"Buys max: {MAX_BUYS_H24}\n"
-        f"Sells max: {MAX_SELLS_H24}\n"
-        "No website: ON ✅",
+        f"Sells max: {MAX_SELLS_H24}",
         parse_mode="Markdown",
     )
 
@@ -304,6 +294,68 @@ async def cmd_scannow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await scan_and_send(context)
 
 
+async def cmd_why(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Diagnose why tokens fail filters."""
+    await update.message.reply_text("🔍 Running diagnostic...")
+
+    chain = context.args[0].lower() if context.args else "solana"
+    profiles = fetch_latest_profiles()
+    chain_profiles = [p for p in profiles if (p.get("chainId") or "").lower() == chain]
+
+    if not chain_profiles:
+        await update.message.reply_text(f"No profiles for {chain}")
+        return
+
+    lines = [f"*Chain: {chain}* — {len(chain_profiles)} profiles\n"]
+
+    for profile in chain_profiles[:8]:
+        addr = profile.get("tokenAddress", "?")
+        pairs = fetch_token_pairs(chain, addr)
+        if not pairs:
+            lines.append(f"`{addr[:8]}` — no pairs")
+            continue
+
+        p = pairs[0]
+        base = p.get("baseToken") or {}
+        sym = base.get("symbol", "?")
+
+        liq = (p.get("liquidity") or {}).get("usd")
+        mc = p.get("marketCap")
+        fdv = p.get("fdv")
+        created = p.get("pairCreatedAt")
+        vol = (p.get("volume") or {}).get("h24")
+        txns = (p.get("txns") or {}).get("h24") or {}
+        buys = txns.get("buys")
+        sells = txns.get("sells")
+        socials = (p.get("info") or {}).get("socials") or []
+        has_tg = any((s.get("platform") or "").lower() == "telegram" for s in socials)
+
+        reasons = []
+        if liq is None or not (MIN_LIQ <= liq <= MAX_LIQ):
+            reasons.append(f"liq={liq}")
+        if mc is None or mc > MAX_MC:
+            reasons.append(f"mc={mc}")
+        if fdv is None or fdv > MAX_FDV:
+            reasons.append(f"fdv={fdv}")
+        if not created:
+            reasons.append("no age")
+        if vol is None or vol > MAX_VOL_H24:
+            reasons.append(f"vol={vol}")
+        if buys is None or buys > MAX_BUYS_H24:
+            reasons.append(f"buys={buys}")
+        if sells is None or sells > MAX_SELLS_H24:
+            reasons.append(f"sells={sells}")
+        if not has_tg:
+            reasons.append("no telegram")
+
+        if reasons:
+            lines.append(f"`{sym}` ❌ {', '.join(reasons)}")
+        else:
+            lines.append(f"`{sym}` ✅ PASSES")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 # --------------------------------------------------
 # CORE SCAN LOOP
 # --------------------------------------------------
@@ -347,6 +399,7 @@ def main():
     app.add_handler(CommandHandler("addchain", cmd_addchain))
     app.add_handler(CommandHandler("removechain", cmd_removechain))
     app.add_handler(CommandHandler("scannow", cmd_scannow))
+    app.add_handler(CommandHandler("why", cmd_why))
 
     if app.job_queue is not None:
         app.job_queue.run_repeating(scan_and_send, interval=CHECK_INTERVAL, first=10)
